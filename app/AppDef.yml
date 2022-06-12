@@ -1,0 +1,239 @@
+Parameters:
+
+    EnvironmentName:
+        Description: Name of the Env
+        Type: String
+
+    AdminIp:
+        Description: Set this Ip in the Parameter file inorder to be able to SSH in to the Jump server if not set you will not be able to connect
+        Type: String
+
+    AutoType:
+        Description: The Type of the AutoScaled Nodes
+        Type: String
+
+    JumpType:
+        Description: The Type of the Jump Node
+        Type: String
+
+    AmiID:
+        Description: The Image Id for all nodes
+        Type: String    
+
+    JumpKey:
+        Description: Name of the keypair used on the jumpserver
+        Type: String
+
+Resources:
+
+    ALBSecG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http to LB and from LB to balanced nodes
+            VpcId:  
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+    
+    BalancedNodesSecG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http from LB to balanced nodes
+            VpcId: 
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: !Join [ "/", [!GetAtt JumpServer.PrivateIp,32]]
+            SecurityGroupEgress:
+                - IpProtocol: "-1"
+                  FromPort: "-1"
+                  ToPort: "-1"
+                  CidrIp: 0.0.0.0/0
+
+    JumpSerSecG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow SSH to Jump Server
+            VpcId:  
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: !Ref AdminIp
+            SecurityGroupEgress:
+                - IpProtocol: "-1"
+                  FromPort: "-1"
+                  ToPort: "-1"
+                  CidrIp: 0.0.0.0/0             
+
+    UdacityS3ReadOnlyEC2:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action:
+                          - "sts:AssumeRole"
+    
+    BucketAccessPol:
+        Type: AWS::IAM::Policy
+        Properties:
+            PolicyName: "AmazonS3ReadOnlyAccess"
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action: "*"
+                      Resource: "*"
+            Roles: 
+                - !Ref UdacityS3ReadOnlyEC2
+
+    ProfileWithRolesForOurApp:
+        Type: AWS::IAM::InstanceProfile
+        Properties: 
+            Roles:
+                - !Ref UdacityS3ReadOnlyEC2
+
+    JumpServer:
+        Type: AWS::EC2::Instance
+        Properties:
+            ImageId: !Ref AmiID
+            InstanceType: !Ref JumpType
+            # KeyName:  !Ref JumpKey
+            AvailabilityZone: !Select [ 0,  !GetAZs '']
+            NetworkInterfaces:
+                - AssociatePublicIpAddress: true
+                  DeviceIndex:  '0'
+                  GroupSet:
+                    - Ref: JumpSerSecG
+                  SubnetId: 
+                      Fn::ImportValue:
+                        !Sub "${EnvironmentName}-PubSub1Id"
+            
+    BalancedLaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            ImageId:  !Ref AmiID
+            InstanceType: !Ref AutoType
+            BlockDeviceMappings:
+                - DeviceName: "/dev/sdf"
+                  Ebs:
+                      VolumeSize: '10'
+            IamInstanceProfile: !Ref ProfileWithRolesForOurApp
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install apache2 -y
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    echo "Udacity Demo Web Server Up and Running!" > index.html
+            SecurityGroups:
+                - Ref: BalancedNodesSecG
+
+    BalancedScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        DependsOn: UdacityS3ReadOnlyEC2
+        Properties:
+            VPCZoneIdentifier:
+                - Fn::ImportValue:
+                      !Sub "${EnvironmentName}-PriSub1Id"
+                - Fn::ImportValue:
+                      !Sub "${EnvironmentName}-PriSub2Id"
+            LaunchConfigurationName:
+                Ref:  BalancedLaunchConfig
+            MaxSize:  '5'
+            MinSize:  '4'
+            TargetGroupARNs:
+                - Ref: BalancedTargetGroup
+
+    BalancedTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckEnabled: true
+            HealthCheckIntervalSeconds: 15
+            HealthCheckPath: '/'
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 12
+            HealthyThresholdCount: 3
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 4
+            VpcId: 
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+
+    Balancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            SecurityGroups:
+                - Ref:  ALBSecG
+            Subnets:
+                - Fn::ImportValue:
+                      !Sub "${EnvironmentName}-PubSub1Id"
+                - Fn::ImportValue:
+                      !Sub "${EnvironmentName}-PubSub2Id"      
+    
+    BalancerListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                - TargetGroupArn: 
+                    Ref:  BalancedTargetGroup
+                  Type: forward
+            LoadBalancerArn: !Ref Balancer
+            Port: 80
+            Protocol: HTTP    
+    
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+                - Type: forward
+                  TargetGroupArn: !Ref BalancedTargetGroup
+            Conditions:
+                - Field: path-pattern
+                  Values:
+                    - '/'
+            ListenerArn: !Ref BalancerListener
+            Priority: 1        
+
+
+                
+
+
+Outputs:
+
+    JumpSerIp:
+        Description: Ip of the JumpServer
+        Value: !GetAtt JumpServer.PublicIp
+        Export:
+            Name: !Sub "${EnvironmentName}-JumpServerIp"
+    
+    LoadBalancerDNSName:
+        Description: DNS name of the load balancer
+        Value: !Join [ "", ["http://", !GetAtt Balancer.DNSName]]
+        Export:
+            Name: !Sub  "${EnvironmentName}-LBEndpoint"
